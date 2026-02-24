@@ -1,0 +1,764 @@
+import {
+  Action,
+  ActionPanel,
+  Cache,
+  Detail,
+  Image,
+  Icon,
+  LaunchProps,
+  List,
+  environment,
+  getPreferenceValues,
+} from "@raycast/api";
+import { useCachedState } from "@raycast/utils";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { searchDocs, searchGlossary } from "./api";
+import { summaryHtmlToMarkdown } from "./summary-to-markdown";
+import type { DocsSearchResult, GlossaryTerm } from "./types";
+
+const DEBOUNCE_MS = 250;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const ASSETS_DIR = `${environment.assetsPath}/icons`;
+const ICONS = {
+  all: `${ASSETS_DIR}/book-2.svg`,
+  cms: `${ASSETS_DIR}/square-letter-c.svg`,
+  commerce: `${ASSETS_DIR}/shopping-cart.svg`,
+  cloud: `${ASSETS_DIR}/cloud.svg`,
+  kb: `${ASSETS_DIR}/book.svg`,
+  glossary: `${ASSETS_DIR}/list-letters.svg`,
+} as const;
+const LIST_ICON_TINT = "#E5422C";
+const DOC_PRODUCTS = [
+  { title: "All Docs", value: "all", icon: ICONS.all },
+  { title: "CMS", value: "cms", icon: ICONS.cms },
+  { title: "Commerce", value: "commerce", icon: ICONS.commerce },
+  { title: "Cloud", value: "cloud", icon: ICONS.cloud },
+  { title: "Knowledge Base", value: "knowledge-base", icon: ICONS.kb },
+  { title: "Glossary", value: "glossary", icon: ICONS.glossary },
+] as const;
+type DocsProduct = (typeof DOC_PRODUCTS)[number]["value"];
+const cache = new Cache({ namespace: "craft-docs-search" });
+const queryCache = new Map<string, DocsSearchResult[]>();
+
+interface Preferences {
+  cmsVersion: "1.x" | "2.x" | "3.x" | "4.x" | "5.x";
+  commerceVersion: "1.x" | "2.x" | "3.x" | "4.x" | "5.x";
+  viewMode: "rich" | "compact";
+}
+
+type Props = LaunchProps<{
+  arguments: { term?: string };
+  launchContext?: { slug?: string; product?: DocsProduct };
+}>;
+
+export default function Command(props: Props) {
+  const preferences = getPreferenceValues<Preferences>();
+  const argumentTerm = props.arguments?.term?.trim();
+  const deeplinkSlug = props.launchContext?.slug?.trim();
+  const deeplinkProduct = props.launchContext?.product;
+  const initialSearchText = argumentTerm || "";
+  const initialSelectedProduct: DocsProduct =
+    deeplinkProduct && DOC_PRODUCTS.some((p) => p.value === deeplinkProduct) ? deeplinkProduct : DOC_PRODUCTS[0].value;
+  const initialGlossaryItems =
+    initialSelectedProduct === "glossary" && !initialSearchText
+      ? readCached(makeRequestCacheKey({ product: "glossary", query: "", version: undefined, scopes: [] })) ?? []
+      : [];
+  const initialShouldSearch = initialSearchText.trim().length > 0 || initialSelectedProduct === "glossary";
+  const [searchText, setSearchText] = useState(initialSearchText);
+  const [query, setQuery] = useState(initialSearchText);
+  const [selectedItemId, setSelectedItemId] = useState<string | undefined>(() => {
+    if (!deeplinkSlug || initialGlossaryItems.length === 0) return undefined;
+    const match =
+      initialGlossaryItems.find((item) => item.slug === deeplinkSlug) ||
+      initialGlossaryItems.find((item) => item.slug?.toLowerCase() === deeplinkSlug.toLowerCase());
+    return match?.id;
+  });
+  const [selectedProduct, setSelectedProduct] = useCachedState<DocsProduct>(
+    "craft-docs-selected-product",
+    initialSelectedProduct,
+  );
+  const [items, setItems] = useState<DocsSearchResult[]>(initialGlossaryItems);
+  const [isLoading, setIsLoading] = useState(initialShouldSearch);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const cmsVersion = normalizeVersionValue(preferences.cmsVersion);
+  const commerceVersion = normalizeVersionValue(preferences.commerceVersion);
+  const versionParam = normalizeVersionValue(getSelectedVersion(preferences, selectedProduct));
+  const apiVersionParam = toApiVersion(versionParam);
+  const isCompactMode = preferences.viewMode === "compact";
+  const scopes = useMemo(
+    () => buildScopes({ selectedProduct, cmsVersion, versionParam }),
+    [cmsVersion, selectedProduct, versionParam],
+  );
+  const requestCacheKey = useMemo(
+    () =>
+      makeRequestCacheKey({
+        product: selectedProduct,
+        query,
+        version: apiVersionParam,
+        scopes,
+      }),
+    [apiVersionParam, query, scopes, selectedProduct],
+  );
+  const hasLiveQuery = searchText.trim().length > 0;
+  const hasQuery = query.trim().length > 0;
+  const isDebouncing = searchText.trim() !== query;
+  const isGlossaryBrowse = selectedProduct === "glossary" && !hasQuery;
+  const shouldSearch = hasLiveQuery || selectedProduct === "glossary";
+  const emptyViewContent = useMemo(
+    () => buildEmptyViewContent(selectedProduct, preferences),
+    [preferences, selectedProduct],
+  );
+
+  const visibleItems = useMemo(() => {
+    return items.filter((item) => {
+      const product = getProductType(item.url);
+      if (selectedProduct === "all") {
+        if (isVersionExemptType(item.type)) {
+          if (product === "cms") return matchesItemVersionOrUnversioned(item, cmsVersion);
+          if (product === "commerce") return matchesItemVersionOrUnversioned(item, commerceVersion);
+          return true;
+        }
+        if (product === "cms") return matchesItemVersion(item, cmsVersion);
+        if (product === "commerce") return matchesItemVersion(item, commerceVersion);
+        return true;
+      }
+      if (product !== selectedProduct) return false;
+      if (isVersionExemptType(item.type)) return matchesItemVersionOrUnversioned(item, versionParam);
+      if (isUnversionedProduct(selectedProduct)) return true;
+      return matchesItemVersion(item, versionParam);
+    });
+  }, [commerceVersion, cmsVersion, items, selectedProduct, versionParam]);
+  const groupedGlossary = useMemo(
+    () => (isGlossaryBrowse ? groupByLetter(visibleItems) : null),
+    [isGlossaryBrowse, visibleItems],
+  );
+  const showPlaceholder =
+    !shouldSearch ||
+    (shouldSearch &&
+      !isGlossaryBrowse &&
+      !errorMessage &&
+      visibleItems.length === 0 &&
+      (isLoading || isDebouncing));
+  const showGlossaryLoadingRow = isGlossaryBrowse && !deeplinkSlug && !errorMessage && visibleItems.length === 0;
+
+  useEffect(() => {
+    if (!deeplinkProduct) return;
+    if (!DOC_PRODUCTS.some((p) => p.value === deeplinkProduct)) return;
+    setSelectedProduct(deeplinkProduct);
+  }, [deeplinkProduct, setSelectedProduct]);
+
+  useEffect(() => {
+    if (!deeplinkSlug) return;
+    const match =
+      visibleItems.find((item) => item.slug === deeplinkSlug) ||
+      visibleItems.find((item) => item.slug?.toLowerCase() === deeplinkSlug.toLowerCase());
+    if (match) {
+      setSelectedItemId(match.id);
+    }
+  }, [deeplinkSlug, visibleItems]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const nextQuery = searchText.trim();
+      if (nextQuery !== query) {
+        if (nextQuery || selectedProduct === "glossary") {
+          setIsLoading(true);
+        }
+        setQuery(nextQuery);
+      }
+    }, DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchText, query, selectedProduct]);
+
+  useEffect(() => {
+    if (query || selectedProduct === "glossary") {
+      setIsLoading(true);
+    }
+  }, [selectedProduct, query]);
+
+  useEffect(() => {
+    if (!query && selectedProduct !== "glossary") {
+      setItems([]);
+      setErrorMessage(null);
+      setIsLoading(false);
+      abortRef.current?.abort();
+      return;
+    }
+
+    const controller = new AbortController();
+    abortRef.current?.abort();
+    abortRef.current = controller;
+
+    // Fast-path glossary term lookups from cached full glossary list.
+    if (selectedProduct === "glossary" && query) {
+      const cachedGlossaryItems = readCached(
+        makeRequestCacheKey({ product: "glossary", query: "", version: undefined, scopes: [] }),
+      );
+      if (cachedGlossaryItems) {
+        const q = query.trim().toLowerCase();
+        const localMatches = cachedGlossaryItems.filter((item) => {
+          const haystack = `${item.title} ${item.slug ?? ""} ${item.summaryPlain ?? ""}`.toLowerCase();
+          return haystack.includes(q);
+        });
+        setItems(localMatches);
+      }
+    }
+
+    const inMemoryCached = queryCache.get(requestCacheKey);
+    if (inMemoryCached) {
+      setItems(inMemoryCached);
+      setErrorMessage(null);
+      setIsLoading(false);
+      return () => controller.abort();
+    }
+
+    const persistedCached = readCached(requestCacheKey);
+    if (persistedCached) {
+      queryCache.set(requestCacheKey, persistedCached);
+      setItems(persistedCached);
+      setErrorMessage(null);
+      setIsLoading(false);
+      return () => controller.abort();
+    }
+
+    setIsLoading(true);
+    setErrorMessage(null);
+
+    const run =
+      selectedProduct === "glossary"
+        ? searchGlossary(query, { signal: controller.signal }).then((terms) => terms.map(mapGlossaryTermToDocsResult))
+        : searchDocs(query, { signal: controller.signal, version: apiVersionParam, scopes });
+
+    run
+      .then((results) => {
+        queryCache.set(requestCacheKey, results);
+        writeCached(requestCacheKey, results);
+        setItems(results);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === "AbortError") return;
+        const staleResults = readCached(requestCacheKey, true);
+        if (staleResults) {
+          queryCache.set(requestCacheKey, staleResults);
+          setItems(staleResults);
+          setErrorMessage(null);
+          return;
+        }
+        setItems([]);
+        setErrorMessage("Could not fetch docs search results.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setIsLoading(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [query, apiVersionParam, requestCacheKey, scopes, selectedProduct]);
+
+  return (
+    <List
+      isLoading={isLoading}
+      isShowingDetail={!isCompactMode}
+      filtering={false}
+      searchBarPlaceholder={buildSearchPlaceholder(selectedProduct, preferences)}
+      searchText={searchText}
+      onSearchTextChange={setSearchText}
+      selectedItemId={selectedItemId}
+      searchBarAccessory={
+        <List.Dropdown
+          tooltip="Craft Docs Section"
+          value={selectedProduct}
+          onChange={(value) => {
+            const nextProduct = value as DocsProduct;
+            setSelectedProduct(nextProduct);
+            if (nextProduct === "glossary" || searchText.trim().length > 0) {
+              setIsLoading(true);
+            }
+          }}
+        >
+          <List.Dropdown.Section>
+            <List.Dropdown.Item
+              title={getDropdownTitle(DOC_PRODUCTS[0].value, preferences)}
+              value={DOC_PRODUCTS[0].value}
+              icon={tintListIcon(DOC_PRODUCTS[0].icon)}
+            />
+          </List.Dropdown.Section>
+          <List.Dropdown.Section>
+            {DOC_PRODUCTS.slice(1, 4).map((product) => (
+              <List.Dropdown.Item
+                key={product.value}
+                title={getDropdownTitle(product.value, preferences)}
+                value={product.value}
+                icon={tintListIcon(product.icon)}
+              />
+            ))}
+          </List.Dropdown.Section>
+          <List.Dropdown.Section>
+            {DOC_PRODUCTS.slice(4).map((product) => (
+              <List.Dropdown.Item
+                key={product.value}
+                title={getDropdownTitle(product.value, preferences)}
+                value={product.value}
+                icon={tintListIcon(product.icon)}
+              />
+            ))}
+          </List.Dropdown.Section>
+        </List.Dropdown>
+      }
+      throttle
+    >
+      {showPlaceholder && (
+        <List.EmptyView
+          title={emptyViewContent.title}
+          description={emptyViewContent.description}
+          icon={buildEmptyViewIcon(selectedProduct)}
+        />
+      )}
+
+      {showGlossaryLoadingRow && (
+        <List.Section title="A">
+          <List.Item id="glossary-loading-placeholder" title="" />
+        </List.Section>
+      )}
+
+      {shouldSearch && !!errorMessage && (
+        <List.Item id="docs-search-error" title={errorMessage} icon={Icon.ExclamationMark} actions={<ActionPanel />} />
+      )}
+
+      {shouldSearch &&
+        !errorMessage &&
+        (isGlossaryBrowse
+          ? groupedGlossary?.keys.map((letter) => (
+              <List.Section key={letter} title={letter}>
+                {(groupedGlossary.map.get(letter) ?? []).map((item) => (
+                  <ResultRow
+                    key={item.id}
+                    item={item}
+                    selectedProduct={selectedProduct}
+                    isCompactMode={isCompactMode}
+                  />
+                ))}
+              </List.Section>
+            ))
+          : visibleItems.map((item) => (
+              <ResultRow key={item.id} item={item} selectedProduct={selectedProduct} isCompactMode={isCompactMode} />
+            )))}
+    </List>
+  );
+}
+
+function ResultRow({
+  item,
+  selectedProduct,
+  isCompactMode,
+}: {
+  item: DocsSearchResult;
+  selectedProduct: DocsProduct;
+  isCompactMode: boolean;
+}) {
+  return (
+    <List.Item
+      id={item.id}
+      title={item.title}
+      subtitle={isCompactMode ? buildSubtitle(item) : undefined}
+      icon={buildListIcon(item, selectedProduct, isCompactMode)}
+      detail={isCompactMode ? undefined : <DocsItemDetail item={item} />}
+      actions={
+        <ActionPanel>
+          <Action.OpenInBrowser url={item.url} icon={ACTION_ICONS.globe} />
+          {isCompactMode && (
+            <Action.Push title="View Detail" icon={ACTION_ICONS.sidebar} target={<DocsDetailView item={item} />} />
+          )}
+          {(item.docsLinks?.length ?? 0) > 0 && (
+            <ActionPanel.Submenu
+              title="In the Docs"
+              icon={ACTION_ICONS.book}
+              shortcut={{ modifiers: ["cmd"], key: "d" }}
+            >
+              {item.docsLinks?.map((d, i) => (
+                <Action.OpenInBrowser
+                  key={`${item.id}-doc-action-${i}`}
+                  title={d.title}
+                  icon={ACTION_ICONS.book}
+                  url={d.url}
+                />
+              ))}
+            </ActionPanel.Submenu>
+          )}
+          <Action.CopyToClipboard title="Copy URL" content={item.url} icon={ACTION_ICONS.clipboard} />
+        </ActionPanel>
+      }
+    />
+  );
+}
+
+function DocsDetailView({ item }: { item: DocsSearchResult }) {
+  return (
+    <Detail
+      markdown={buildDetailMarkdown(item)}
+      metadata={<DocsMetadata item={item} />}
+      actions={
+        <ActionPanel>
+          <Action.OpenInBrowser url={item.url} icon={ACTION_ICONS.globe} />
+          {(item.docsLinks?.length ?? 0) > 0 && (
+            <ActionPanel.Submenu
+              title="In the Docs"
+              icon={ACTION_ICONS.book}
+              shortcut={{ modifiers: ["cmd"], key: "d" }}
+            >
+              {item.docsLinks?.map((d, i) => (
+                <Action.OpenInBrowser
+                  key={`${item.id}-detail-doc-action-${i}`}
+                  title={d.title}
+                  icon={ACTION_ICONS.book}
+                  url={d.url}
+                />
+              ))}
+            </ActionPanel.Submenu>
+          )}
+          <Action.CopyToClipboard title="Copy URL" content={item.url} icon={ACTION_ICONS.clipboard} />
+        </ActionPanel>
+      }
+    />
+  );
+}
+
+function DocsItemDetail({ item }: { item: DocsSearchResult }) {
+  return <List.Item.Detail markdown={buildDetailMarkdown(item)} metadata={<DocsMetadata item={item} />} />;
+}
+
+function DocsMetadata({ item }: { item: DocsSearchResult }) {
+  const docs = item.docsLinks ?? [];
+
+  return (
+    <List.Item.Detail.Metadata>
+      {docs.map((d, i) => (
+        <List.Item.Detail.Metadata.Link
+          key={`${item.id}-doc-${i}`}
+          title={d.title}
+          text={`View in ${linkDestinationForUrl(d.url)}`}
+          target={d.url}
+        />
+      ))}
+      <List.Item.Detail.Metadata.Link
+        title={item.title}
+        text={`View in ${linkDestinationForUrl(item.url)}`}
+        target={item.url}
+      />
+    </List.Item.Detail.Metadata>
+  );
+}
+
+function buildDetailMarkdown(item: DocsSearchResult): string {
+  const description = item.summaryHtml
+    ? summaryHtmlToMarkdown(item.summaryHtml)
+    : item.summaryPlain?.trim() || "No summary available.";
+  return `# ${item.title}
+
+${description}`;
+}
+
+function buildSubtitle(item: DocsSearchResult): string | undefined {
+  const summary = toPlainSubtitle(item.summaryPlain);
+  if (!summary) return undefined;
+  return summary;
+}
+
+function toPlainSubtitle(summary: string | undefined): string | undefined {
+  if (!summary) return undefined;
+  return summary
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildListIcon(
+  item: DocsSearchResult,
+  selectedProduct: DocsProduct,
+  isCompactMode: boolean,
+): Image.ImageLike | { value: Image.ImageLike | undefined | null; tooltip: string } {
+  let icon: Image.ImageLike;
+  let tooltip: string | undefined;
+
+  if (selectedProduct === "all") {
+    const source = getAllDocsSourceLabel(item);
+    icon = tintListIcon(getIconForSourceLabel(source));
+    tooltip = getSourceTooltip(source);
+  } else {
+    const product = getProductType(item.url);
+    if (product === "cms") icon = tintListIcon(DOC_PRODUCTS[1].icon);
+    else if (product === "commerce") icon = tintListIcon(DOC_PRODUCTS[2].icon);
+    else if (product === "cloud") icon = tintListIcon(DOC_PRODUCTS[3].icon);
+    else if (product === "knowledge-base") icon = tintListIcon(DOC_PRODUCTS[4].icon);
+    else icon = tintListIcon(DOC_PRODUCTS[5].icon);
+  }
+
+  if (tooltip) {
+    return { value: icon, tooltip };
+  }
+
+  return icon;
+}
+
+function getProductType(url: string): DocsProduct {
+  const normalized = url.toLowerCase();
+  if (normalized.includes("/glossary")) return "glossary";
+  if (normalized.includes("/knowledge-base") || normalized.includes("/kb/")) return "knowledge-base";
+  if (normalized.includes("/docs/commerce")) return "commerce";
+  if (normalized.includes("/docs/cloud")) return "cloud";
+  return "cms";
+}
+
+function getSelectedVersion(
+  preferences: Preferences,
+  product: DocsProduct,
+): Preferences[keyof Preferences] | undefined {
+  if (product === "all") return undefined;
+  if (product === "commerce") return preferences.commerceVersion;
+  if (isUnversionedProduct(product)) return undefined;
+  return preferences.cmsVersion;
+}
+
+function toApiVersion(version: DocsSearchResult["craftVersion"] | undefined): string | undefined {
+  if (!version) return undefined;
+  const match = version.match(/^([1-5])\.x$/);
+  return match?.[1];
+}
+
+function normalizeVersionValue(value: string | undefined): DocsSearchResult["craftVersion"] | undefined {
+  if (!value) return undefined;
+  if (/^[1-5]\.x$/.test(value)) return value as DocsSearchResult["craftVersion"];
+  if (/^[1-5]$/.test(value)) return `${value}.x` as DocsSearchResult["craftVersion"];
+  return undefined;
+}
+
+function extractVersionFromUrl(url: string): DocsSearchResult["craftVersion"] | undefined {
+  const match = url.toLowerCase().match(/(?:^|\/)([1-5])\.x(?:\/|$|[?#])/);
+  if (!match) return undefined;
+  return `${match[1]}.x` as DocsSearchResult["craftVersion"];
+}
+
+function matchesItemVersion(item: DocsSearchResult, version: DocsSearchResult["craftVersion"] | undefined): boolean {
+  if (!version) return false;
+  const urlVersion = extractVersionFromUrl(item.url);
+  if (urlVersion) return urlVersion === version;
+  if (item.craftVersion) return item.craftVersion === version;
+  return false;
+}
+
+function matchesItemVersionOrUnversioned(
+  item: DocsSearchResult,
+  version: DocsSearchResult["craftVersion"] | undefined,
+): boolean {
+  const urlVersion = extractVersionFromUrl(item.url);
+  if (urlVersion) return urlVersion === version;
+  if (item.craftVersion) return item.craftVersion === version;
+  return true;
+}
+
+function isVersionExemptType(type?: string): boolean {
+  const normalized = type?.toLowerCase()?.trim();
+  return normalized === "term" || normalized === "knowledge base article";
+}
+
+function isUnversionedProduct(product: DocsProduct): boolean {
+  return product === "cloud" || product === "knowledge-base" || product === "glossary";
+}
+
+function getAllDocsSourceLabel(item: DocsSearchResult): "CMS" | "Commerce" | "Cloud" | "KB" | "Term" {
+  const normalizedType = item.type?.toLowerCase()?.trim();
+  if (normalizedType === "term") return "Term";
+  if (normalizedType === "knowledge base article") return "KB";
+
+  const product = getProductType(item.url);
+  if (product === "commerce") return "Commerce";
+  if (product === "cloud") return "Cloud";
+  if (product === "knowledge-base") return "KB";
+  if (product === "glossary") return "Term";
+  return "CMS";
+}
+
+function getIconForSourceLabel(source: "CMS" | "Commerce" | "Cloud" | "KB" | "Term"): string {
+  if (source === "CMS") return DOC_PRODUCTS[1].icon;
+  if (source === "Commerce") return DOC_PRODUCTS[2].icon;
+  if (source === "Cloud") return DOC_PRODUCTS[3].icon;
+  if (source === "KB") return DOC_PRODUCTS[4].icon;
+  return DOC_PRODUCTS[5].icon;
+}
+
+function getSourceTooltip(source: "CMS" | "Commerce" | "Cloud" | "KB" | "Term"): string | undefined {
+  if (source === "CMS") return "Craft CMS";
+  if (source === "Commerce") return "Craft Commerce";
+  if (source === "KB") return "Knowledge Base";
+  if (source === "Term") return "Glossary Term";
+  return undefined;
+}
+
+function tintListIcon(source: string): { source: string; tintColor: string } {
+  return { source, tintColor: LIST_ICON_TINT };
+}
+
+function buildEmptyViewIcon(selectedProduct: DocsProduct): { source: string; tintColor: string } {
+  const product = DOC_PRODUCTS.find((item) => item.value === selectedProduct) ?? DOC_PRODUCTS[0];
+  return tintListIcon(product.icon);
+}
+
+function buildEmptyViewContent(
+  product: DocsProduct,
+  preferences: Preferences,
+): { title: string; description: string } {
+  if (product === "cms") {
+    return {
+      title: "Craft CMS Docs",
+      description: `Search across official Craft CMS ${preferences.cmsVersion} docs.`,
+    };
+  }
+  if (product === "commerce") {
+    return {
+      title: "Craft Commerce Docs",
+      description: `Search across official Craft Commerce ${preferences.commerceVersion} docs.`,
+    };
+  }
+  if (product === "cloud") {
+    return {
+      title: "Craft Cloud Docs",
+      description: "Search across official Craft Cloud docs.",
+    };
+  }
+  if (product === "knowledge-base") {
+    return {
+      title: "Craft Knowledge Base",
+      description: "Search tutorials, support articles, and troubleshooting guides.",
+    };
+  }
+  if (product === "glossary") {
+    return {
+      title: "Craft Glossary",
+      description: "Search or browse Craft CMS glossary terms.",
+    };
+  }
+  return {
+    title: "Craft Docs",
+    description: "Search across Craft CMS, Commerce, Cloud, Knowledge Base, and Glossary entries.",
+  };
+}
+
+function linkDestinationForUrl(url: string): "Docs" | "Knowledge Base" | "Glossary" {
+  const normalized = url.toLowerCase();
+  if (normalized.includes("/glossary/")) return "Glossary";
+  if (normalized.includes("/knowledge-base") || normalized.includes("/kb/")) return "Knowledge Base";
+  return "Docs";
+}
+
+function makeRequestCacheKey({
+  product,
+  query,
+  version,
+  scopes,
+}: {
+  product: DocsProduct;
+  query: string;
+  version?: string;
+  scopes: string[];
+}): string {
+  return JSON.stringify({
+    product,
+    query: query.trim(),
+    version: version ?? "",
+    scopes: [...scopes].sort(),
+  });
+}
+
+function writeCached(key: string, items: DocsSearchResult[]) {
+  try {
+    cache.set(key, JSON.stringify({ at: Date.now(), items }));
+  } catch {
+    // ignore cache write failures
+  }
+}
+
+function readCached(key: string, allowStale = false): DocsSearchResult[] | null {
+  try {
+    const raw = cache.get(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { at: number; items: DocsSearchResult[] };
+    if (!allowStale && Date.now() - parsed.at > CACHE_TTL_MS) return null;
+    return parsed.items ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function buildScopes({
+  selectedProduct,
+  cmsVersion,
+  versionParam,
+}: {
+  selectedProduct: DocsProduct;
+  cmsVersion: DocsSearchResult["craftVersion"] | undefined;
+  versionParam: DocsSearchResult["craftVersion"] | undefined;
+}): string[] {
+  if (selectedProduct === "cms") {
+    return [versionParam ? `docs/${versionParam}` : `docs/${cmsVersion ?? "5.x"}`];
+  }
+  if (selectedProduct === "commerce") return ["docs/commerce"];
+  if (selectedProduct === "cloud") return ["docs/cloud"];
+  return [];
+}
+
+function getDropdownTitle(product: DocsProduct, preferences: Preferences): string {
+  if (product === "cms") return `CMS (${preferences.cmsVersion})`;
+  if (product === "commerce") return `Commerce (${preferences.commerceVersion})`;
+  const base = DOC_PRODUCTS.find((item) => item.value === product);
+  return base?.title ?? product;
+}
+
+function buildSearchPlaceholder(product: DocsProduct, preferences: Preferences): string {
+  if (product === "cms") return `Search Craft CMS ${preferences.cmsVersion} Docs...`;
+  if (product === "commerce") return `Search Craft Commerce ${preferences.commerceVersion} Docs...`;
+  if (product === "cloud") return "Search Craft Cloud Docs...";
+  if (product === "knowledge-base") return "Search Craft Knowledge Base...";
+  if (product === "glossary") return "Search Craft Glossary...";
+  return "Search Craft Docs...";
+}
+
+function mapGlossaryTermToDocsResult(term: GlossaryTerm): DocsSearchResult {
+  return {
+    id: `glossary-${term.id}`,
+    title: term.title,
+    url: term.url,
+    slug: term.slug,
+    summaryPlain: term.summaryPlain,
+    summaryHtml: term.summaryHtml,
+    type: term.type,
+    docsLinks: term.docsLinks,
+    section: undefined,
+    craftVersion: undefined,
+  };
+}
+
+function groupByLetter(items: DocsSearchResult[]) {
+  const map = new Map<string, DocsSearchResult[]>();
+  for (const item of items) {
+    const first = (item.title?.trim()?.[0] || "").toUpperCase();
+    const key = /^[A-Z]$/.test(first) ? first : "#";
+    const arr = map.get(key);
+    if (arr) arr.push(item);
+    else map.set(key, [item]);
+  }
+  const keys = Array.from(map.keys()).sort((a, b) => {
+    if (a === "#" && b !== "#") return 1;
+    if (b === "#" && a !== "#") return -1;
+    return a.localeCompare(b);
+  });
+  return { keys, map };
+}
+const ACTION_ICONS = {
+  globe: { source: Icon.Globe, tintColor: LIST_ICON_TINT },
+  book: { source: Icon.Book, tintColor: LIST_ICON_TINT },
+  clipboard: { source: Icon.Clipboard, tintColor: LIST_ICON_TINT },
+  sidebar: { source: Icon.Sidebar, tintColor: LIST_ICON_TINT },
+} as const;
