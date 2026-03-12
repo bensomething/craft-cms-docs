@@ -10,6 +10,7 @@ import {
   List,
   environment,
   getPreferenceValues,
+  open,
 } from "@raycast/api";
 import { useCachedState } from "@raycast/utils";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -20,6 +21,8 @@ import type { DocsSearchResult, GlossaryTerm } from "./types";
 const DEBOUNCE_MS = 250;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const GLOSSARY_INDEX_CACHE_KEY = "glossary-index";
+const RECENT_ITEMS_CACHE_KEY = "recent-items";
+const RECENT_ITEMS_LIMIT = 10;
 const ASSETS_DIR = `${environment.assetsPath}/icons`;
 const ICONS = {
   all: `${ASSETS_DIR}/book-2.svg`,
@@ -64,10 +67,12 @@ export default function Command(props: Props) {
   const deeplinkProduct = props.launchContext?.product;
   const forceAllDocsForArgument = Boolean(argumentTerm);
   const initialSearchText = argumentTerm || "";
+  const launchSelectedProduct: DocsProduct | undefined =
+    deeplinkProduct && DOC_PRODUCTS.some((p) => p.value === deeplinkProduct) ? deeplinkProduct : undefined;
   const initialSelectedProduct: DocsProduct = forceAllDocsForArgument
     ? "all"
-    : deeplinkProduct && DOC_PRODUCTS.some((p) => p.value === deeplinkProduct)
-      ? deeplinkProduct
+    : launchSelectedProduct
+      ? launchSelectedProduct
       : DOC_PRODUCTS[0].value;
   const initialGlossaryItems =
     initialSelectedProduct === "glossary" && !initialSearchText
@@ -84,40 +89,48 @@ export default function Command(props: Props) {
     "craft-docs-selected-product",
     initialSelectedProduct,
   );
+  const [launchProductOverride, setLaunchProductOverride] = useState<DocsProduct | undefined>(() =>
+    forceAllDocsForArgument ? "all" : launchSelectedProduct,
+  );
+  const effectiveSelectedProduct: DocsProduct = launchProductOverride ?? selectedProduct;
   const [bookmarks, setBookmarks] = useCachedState<DocsSearchResult[]>("craft-docs-bookmarks", []);
+  const [recentItems, setRecentItems] = useCachedState<DocsSearchResult[]>(
+    "craft-docs-recent",
+    readRecentItems() ?? [],
+  );
   const [items, setItems] = useState<DocsSearchResult[]>(initialGlossaryItems);
   const [isLoading, setIsLoading] = useState(initialShouldSearch);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const cmsVersion = normalizeVersionValue(preferences.cmsVersion);
   const commerceVersion = normalizeVersionValue(preferences.commerceVersion);
-  const versionParam = normalizeVersionValue(getSelectedVersion(preferences, selectedProduct));
+  const versionParam = normalizeVersionValue(getSelectedVersion(preferences, effectiveSelectedProduct));
   const apiVersionParam = toApiVersion(versionParam);
   const isCompactMode = preferences.viewMode === "compact";
   const scopes = useMemo(
-    () => buildScopes({ selectedProduct, cmsVersion, versionParam }),
-    [cmsVersion, selectedProduct, versionParam],
+    () => buildScopes({ selectedProduct: effectiveSelectedProduct, cmsVersion, versionParam }),
+    [cmsVersion, effectiveSelectedProduct, versionParam],
   );
   const requestCacheKey = useMemo(
     () =>
       makeRequestCacheKey({
-        product: selectedProduct,
+        product: effectiveSelectedProduct,
         query,
         version: apiVersionParam,
         scopes,
       }),
-    [apiVersionParam, query, scopes, selectedProduct],
+    [apiVersionParam, effectiveSelectedProduct, query, scopes],
   );
   const hasLiveQuery = searchText.trim().length > 0;
   const hasQuery = query.trim().length > 0;
   const isDebouncing = searchText.trim() !== query;
-  const isGlossaryBrowse = selectedProduct === "glossary" && !hasQuery;
-  const isBookmarksMode = selectedProduct === "bookmarks";
-  const shouldSearch = hasLiveQuery || selectedProduct === "glossary" || isBookmarksMode;
+  const isGlossaryBrowse = effectiveSelectedProduct === "glossary" && !hasQuery;
+  const isBookmarksMode = effectiveSelectedProduct === "bookmarks";
+  const shouldSearch = hasLiveQuery || effectiveSelectedProduct === "glossary" || isBookmarksMode;
   const bookmarkedUrls = useMemo(() => new Set((bookmarks ?? []).map((item) => item.url)), [bookmarks]);
   const emptyViewContent = useMemo(
-    () => buildEmptyViewContent(selectedProduct, preferences),
-    [preferences, selectedProduct],
+    () => buildEmptyViewContent(effectiveSelectedProduct, preferences),
+    [effectiveSelectedProduct, preferences],
   );
 
   const visibleItems = useMemo(() => {
@@ -132,7 +145,7 @@ export default function Command(props: Props) {
 
     return items.filter((item) => {
       const product = getProductType(item.url);
-      if (selectedProduct === "all") {
+      if (effectiveSelectedProduct === "all") {
         if (isVersionExemptType(item.type)) {
           if (product === "cms") return matchesItemVersionOrUnversioned(item, cmsVersion);
           if (product === "commerce") return matchesItemVersionOrUnversioned(item, commerceVersion);
@@ -142,19 +155,29 @@ export default function Command(props: Props) {
         if (product === "commerce") return matchesItemVersion(item, commerceVersion);
         return true;
       }
-      if (product !== selectedProduct) return false;
+      if (product !== effectiveSelectedProduct) return false;
       if (isVersionExemptType(item.type)) return matchesItemVersionOrUnversioned(item, versionParam);
-      if (isUnversionedProduct(selectedProduct)) return true;
+      if (isUnversionedProduct(effectiveSelectedProduct)) return true;
       return matchesItemVersion(item, versionParam);
     });
-  }, [bookmarks, commerceVersion, cmsVersion, isBookmarksMode, items, searchText, selectedProduct, versionParam]);
+  }, [
+    bookmarks,
+    commerceVersion,
+    cmsVersion,
+    effectiveSelectedProduct,
+    isBookmarksMode,
+    items,
+    searchText,
+    versionParam,
+  ]);
   const groupedGlossary = useMemo(
     () => (isGlossaryBrowse ? groupByLetter(visibleItems) : null),
     [isGlossaryBrowse, visibleItems],
   );
+  const showRecentHome = effectiveSelectedProduct === "all" && !shouldSearch && (recentItems?.length ?? 0) > 0;
   const showPlaceholder =
-    (!shouldSearch && selectedProduct !== "bookmarks") ||
-    (selectedProduct === "bookmarks" && !errorMessage && visibleItems.length === 0) ||
+    (!shouldSearch && effectiveSelectedProduct !== "bookmarks" && !showRecentHome) ||
+    (effectiveSelectedProduct === "bookmarks" && !errorMessage && visibleItems.length === 0) ||
     (shouldSearch &&
       !isGlossaryBrowse &&
       !isBookmarksMode &&
@@ -192,34 +215,34 @@ export default function Command(props: Props) {
     const timer = setTimeout(() => {
       const nextQuery = searchText.trim();
       if (nextQuery !== query) {
-        if (nextQuery || selectedProduct === "glossary") {
+        if (nextQuery || effectiveSelectedProduct === "glossary") {
           setIsLoading(true);
         }
         setQuery(nextQuery);
       }
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [searchText, query, selectedProduct]);
+  }, [searchText, query, effectiveSelectedProduct]);
 
   useEffect(() => {
-    if (selectedProduct === "bookmarks") {
+    if (effectiveSelectedProduct === "bookmarks") {
       setIsLoading(false);
       return;
     }
-    if (query || selectedProduct === "glossary") {
+    if (query || effectiveSelectedProduct === "glossary") {
       setIsLoading(true);
     }
-  }, [selectedProduct, query]);
+  }, [effectiveSelectedProduct, query]);
 
   useEffect(() => {
-    if (selectedProduct === "bookmarks") {
+    if (effectiveSelectedProduct === "bookmarks") {
       setErrorMessage(null);
       setIsLoading(false);
       abortRef.current?.abort();
       return;
     }
 
-    if (!query && selectedProduct !== "glossary") {
+    if (!query && effectiveSelectedProduct !== "glossary") {
       setItems([]);
       setErrorMessage(null);
       setIsLoading(false);
@@ -232,7 +255,7 @@ export default function Command(props: Props) {
     abortRef.current = controller;
 
     // Fast-path glossary term lookups from cached full glossary list.
-    if (selectedProduct === "glossary" && query) {
+    if (effectiveSelectedProduct === "glossary" && query) {
       const cachedGlossaryItems = readCached(
         makeRequestCacheKey({ product: "glossary", query: "", version: undefined, scopes: [] }),
       );
@@ -248,7 +271,7 @@ export default function Command(props: Props) {
 
     const inMemoryCached = queryCache.get(requestCacheKey);
     if (inMemoryCached) {
-      if (selectedProduct === "glossary") writeGlossaryIndex(inMemoryCached);
+      if (effectiveSelectedProduct === "glossary") writeGlossaryIndex(inMemoryCached);
       setItems(inMemoryCached);
       setErrorMessage(null);
       setIsLoading(false);
@@ -257,7 +280,7 @@ export default function Command(props: Props) {
 
     const persistedCached = readCached(requestCacheKey);
     if (persistedCached) {
-      if (selectedProduct === "glossary") writeGlossaryIndex(persistedCached);
+      if (effectiveSelectedProduct === "glossary") writeGlossaryIndex(persistedCached);
       queryCache.set(requestCacheKey, persistedCached);
       setItems(persistedCached);
       setErrorMessage(null);
@@ -269,13 +292,13 @@ export default function Command(props: Props) {
     setErrorMessage(null);
 
     const run =
-      selectedProduct === "glossary"
+      effectiveSelectedProduct === "glossary"
         ? searchGlossary(query, { signal: controller.signal }).then((terms) => terms.map(mapGlossaryTermToDocsResult))
         : searchDocs(query, { signal: controller.signal, version: apiVersionParam, scopes });
 
     run
       .then((results) => {
-        if (selectedProduct === "glossary") writeGlossaryIndex(results);
+        if (effectiveSelectedProduct === "glossary") writeGlossaryIndex(results);
         queryCache.set(requestCacheKey, results);
         writeCached(requestCacheKey, results);
         setItems(results);
@@ -299,7 +322,7 @@ export default function Command(props: Props) {
       });
 
     return () => controller.abort();
-  }, [query, apiVersionParam, requestCacheKey, scopes, selectedProduct]);
+  }, [query, apiVersionParam, requestCacheKey, scopes, effectiveSelectedProduct]);
 
   function addBookmark(item: DocsSearchResult) {
     setBookmarks((current) => {
@@ -313,21 +336,29 @@ export default function Command(props: Props) {
     setBookmarks((current) => (current ?? []).filter((bookmark) => bookmark.url !== item.url));
   }
 
+  function recordRecent(item: DocsSearchResult) {
+    const existing = (recentItems ?? []).filter((recent) => recent.url !== item.url);
+    const nextRecentItems = [item, ...existing].slice(0, RECENT_ITEMS_LIMIT);
+    writeRecentItems(nextRecentItems);
+    setRecentItems(nextRecentItems);
+  }
+
   return (
     <List
       isLoading={isLoading}
       isShowingDetail={!isCompactMode}
       filtering={false}
-      searchBarPlaceholder={buildSearchPlaceholder(selectedProduct, preferences)}
+      searchBarPlaceholder={buildSearchPlaceholder(effectiveSelectedProduct, preferences)}
       searchText={searchText}
       onSearchTextChange={setSearchText}
       selectedItemId={selectedItemId}
       searchBarAccessory={
         <List.Dropdown
           tooltip="Craft Docs Section"
-          value={selectedProduct}
+          value={effectiveSelectedProduct}
           onChange={(value) => {
             const nextProduct = value as DocsProduct;
+            setLaunchProductOverride(undefined);
             setSelectedProduct(nextProduct);
             if (nextProduct === "glossary" || searchText.trim().length > 0) {
               setIsLoading(true);
@@ -376,13 +407,30 @@ export default function Command(props: Props) {
         <List.EmptyView
           title={emptyViewContent.title}
           description={emptyViewContent.description}
-          icon={buildEmptyViewIcon(selectedProduct)}
+          icon={buildEmptyViewIcon(effectiveSelectedProduct)}
         />
       )}
 
       {showGlossaryLoadingRow && (
         <List.Section title="A">
           <List.Item id="glossary-loading-placeholder" title="" />
+        </List.Section>
+      )}
+
+      {showRecentHome && (
+        <List.Section title="Recently Opened">
+          {(recentItems ?? []).map((item) => (
+            <ResultRow
+              key={`recent-${item.id}`}
+              item={item}
+              selectedProduct={effectiveSelectedProduct}
+              isCompactMode={isCompactMode}
+              isBookmarked={bookmarkedUrls.has(item.url)}
+              onAddBookmark={addBookmark}
+              onRemoveBookmark={removeBookmark}
+              onOpenItem={recordRecent}
+            />
+          ))}
         </List.Section>
       )}
 
@@ -399,11 +447,12 @@ export default function Command(props: Props) {
                   <ResultRow
                     key={item.id}
                     item={item}
-                    selectedProduct={selectedProduct}
+                    selectedProduct={effectiveSelectedProduct}
                     isCompactMode={isCompactMode}
                     isBookmarked={bookmarkedUrls.has(item.url)}
                     onAddBookmark={addBookmark}
                     onRemoveBookmark={removeBookmark}
+                    onOpenItem={recordRecent}
                   />
                 ))}
               </List.Section>
@@ -412,11 +461,12 @@ export default function Command(props: Props) {
               <ResultRow
                 key={item.id}
                 item={item}
-                selectedProduct={selectedProduct}
+                selectedProduct={effectiveSelectedProduct}
                 isCompactMode={isCompactMode}
                 isBookmarked={bookmarkedUrls.has(item.url)}
                 onAddBookmark={addBookmark}
                 onRemoveBookmark={removeBookmark}
+                onOpenItem={recordRecent}
               />
             )))}
     </List>
@@ -430,6 +480,7 @@ function ResultRow({
   isBookmarked,
   onAddBookmark,
   onRemoveBookmark,
+  onOpenItem,
 }: {
   item: DocsSearchResult;
   selectedProduct: DocsProduct;
@@ -437,6 +488,7 @@ function ResultRow({
   isBookmarked: boolean;
   onAddBookmark: (item: DocsSearchResult) => void;
   onRemoveBookmark: (item: DocsSearchResult) => void;
+  onOpenItem: (item: DocsSearchResult) => void;
 }) {
   return (
     <List.Item
@@ -448,9 +500,20 @@ function ResultRow({
       detail={isCompactMode ? undefined : <DocsItemDetail item={item} />}
       actions={
         <ActionPanel>
-          <Action.OpenInBrowser url={item.url} icon={ACTION_ICONS.globe} />
+          <Action
+            title="Open in Browser"
+            icon={ACTION_ICONS.globe}
+            onAction={async () => {
+              onOpenItem(item);
+              await open(item.url);
+            }}
+          />
           {isCompactMode && (
-            <Action.Push title="View Detail" icon={ACTION_ICONS.sidebar} target={<DocsDetailView item={item} />} />
+            <Action.Push
+              title="View Detail"
+              icon={ACTION_ICONS.sidebar}
+              target={<DocsDetailView item={item} onOpenItem={onOpenItem} />}
+            />
           )}
           {(item.docsLinks?.length ?? 0) > 0 && (
             <ActionPanel.Submenu
@@ -490,7 +553,13 @@ function ResultRow({
   );
 }
 
-function DocsDetailView({ item }: { item: DocsSearchResult }) {
+function DocsDetailView({
+  item,
+  onOpenItem,
+}: {
+  item: DocsSearchResult;
+  onOpenItem: (item: DocsSearchResult) => void;
+}) {
   const [bookmarks, setBookmarks] = useCachedState<DocsSearchResult[]>("craft-docs-bookmarks", []);
   const isBookmarked = useMemo(
     () => (bookmarks ?? []).some((bookmark) => bookmark.url === item.url),
@@ -515,7 +584,14 @@ function DocsDetailView({ item }: { item: DocsSearchResult }) {
       metadata={<DocsMetadata item={item} />}
       actions={
         <ActionPanel>
-          <Action.OpenInBrowser url={item.url} icon={ACTION_ICONS.globe} />
+          <Action
+            title="Open in Browser"
+            icon={ACTION_ICONS.globe}
+            onAction={async () => {
+              onOpenItem(item);
+              await open(item.url);
+            }}
+          />
           {(item.docsLinks?.length ?? 0) > 0 && (
             <ActionPanel.Submenu
               title="In the Docs"
@@ -566,13 +642,13 @@ function DocsMetadata({ item }: { item: DocsSearchResult }) {
     <List.Item.Detail.Metadata>
       {isGlossaryItem ? (
         <>
-          <List.Item.Detail.Metadata.Link title={item.title} text={linkDestinationForUrl(item.url)} target={item.url} />
+          <List.Item.Detail.Metadata.Link title={linkDestinationForUrl(item.url)} text={item.title} target={item.url} />
           {docs.length > 0 && <List.Item.Detail.Metadata.Separator />}
           {docs.map((d, i) => (
             <List.Item.Detail.Metadata.Link
               key={`${item.id}-doc-${i}`}
-              title={d.title}
-              text={linkDestinationForUrl(d.url)}
+              title={i === 0 ? linkDestinationForUrl(d.url) : ""}
+              text={d.title}
               target={d.url}
             />
           ))}
@@ -582,12 +658,12 @@ function DocsMetadata({ item }: { item: DocsSearchResult }) {
           {docs.map((d, i) => (
             <List.Item.Detail.Metadata.Link
               key={`${item.id}-doc-${i}`}
-              title={d.title}
-              text={linkDestinationForUrl(d.url)}
+              title={i === 0 ? linkDestinationForUrl(d.url) : ""}
+              text={d.title}
               target={d.url}
             />
           ))}
-          <List.Item.Detail.Metadata.Link title={item.title} text={linkDestinationForUrl(item.url)} target={item.url} />
+          <List.Item.Detail.Metadata.Link title={linkDestinationForUrl(item.url)} text={item.title} target={item.url} />
         </>
       )}
     </List.Item.Detail.Metadata>
@@ -782,7 +858,7 @@ function buildEmptyViewContent(product: DocsProduct, preferences: Preferences): 
   if (product === "bookmarks") {
     return {
       title: "Bookmarks",
-      description: "Your saved documentation entries.",
+      description: "Bookmark items from any section to save them here.",
     };
   }
   return {
@@ -867,6 +943,26 @@ function writeGlossaryIndex(items: DocsSearchResult[]) {
     const existing = readGlossaryIndex() ?? {};
     const next = { ...existing, ...buildGlossaryIndex(items) };
     cache.set(GLOSSARY_INDEX_CACHE_KEY, JSON.stringify({ at: Date.now(), index: next }));
+  } catch {
+    // ignore cache write failures
+  }
+}
+
+function readRecentItems(): DocsSearchResult[] | null {
+  try {
+    const raw = cache.get(RECENT_ITEMS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { at: number; items: DocsSearchResult[] };
+    if (Date.now() - parsed.at > CACHE_TTL_MS) return null;
+    return parsed.items ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeRecentItems(items: DocsSearchResult[]) {
+  try {
+    cache.set(RECENT_ITEMS_CACHE_KEY, JSON.stringify({ at: Date.now(), items }));
   } catch {
     // ignore cache write failures
   }
