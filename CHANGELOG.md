@@ -1,3 +1,3 @@
-# Craft CMS Glossary Changelog
+# Craft CMS Docs Changelog
 
 ## [Initial Version] - {PR_MERGE_DATE}

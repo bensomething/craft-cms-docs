@@ -1,3 +1,3 @@
 # Craft CMS Docs
 
-Search the Craft CMS glossary and official docs from Raycast.
+Search the official Craft CMS documentation, knowledge base, and glossary.
