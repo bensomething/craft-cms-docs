@@ -444,7 +444,7 @@ function ResultRow({
       title={item.title}
       subtitle={isCompactMode ? buildSubtitle(item) : undefined}
       accessories={buildBookmarkAccessory(isBookmarked, selectedProduct)}
-      icon={buildListIcon(item, selectedProduct, isCompactMode)}
+      icon={buildListIcon(item, selectedProduct)}
       detail={isCompactMode ? undefined : <DocsItemDetail item={item} />}
       actions={
         <ActionPanel>
@@ -621,7 +621,6 @@ function toPlainSubtitle(summary: string | undefined): string | undefined {
 function buildListIcon(
   item: DocsSearchResult,
   selectedProduct: DocsProduct,
-  isCompactMode: boolean,
 ): Image.ImageLike | { value: Image.ImageLike | undefined | null; tooltip: string } {
   let icon: Image.ImageLike;
   let tooltip: string | undefined;

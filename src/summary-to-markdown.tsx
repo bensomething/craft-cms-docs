@@ -28,12 +28,13 @@ export function summaryHtmlToMarkdown(html: string): string {
     const cleanText = stripAllTags(inner).trim();
     if (!cleanText) return "";
     if (!href) return cleanText;
-    return href.startsWith("raycast://")
-      ? `[${cleanText}](${href})`
-      : `[${cleanText} <sup>↗</sup>](${href})`;
+    return href.startsWith("raycast://") ? `[${cleanText}](${href})` : `[${cleanText} <sup>↗</sup>](${href})`;
   });
 
-  s = stripAllTags(s).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  s = stripAllTags(s)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
   return s;
 }
@@ -47,14 +48,13 @@ function normalizeHref(href: string | undefined): string | undefined {
   return undefined;
 }
 
-
 function stripAllTags(input: string): string {
-    return input
-        .replace(/<[^>]+>/g, "")
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, "\"")
-        .replace(/&#39;/g, "'");
+  return input
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
 }
