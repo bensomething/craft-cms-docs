@@ -1,7 +1,9 @@
+import { environment } from "@raycast/api";
+
 // src/config.ts
 export const DeepLink = {
   publisher: "bensomething",
-  extensionName: "craft-cms-glossary",
+  extensionName: environment.extensionName,
   command: "search-docs",
 };
 

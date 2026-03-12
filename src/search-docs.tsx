@@ -2,6 +2,7 @@ import {
   Action,
   ActionPanel,
   Cache,
+  Color,
   Detail,
   Image,
   Icon,
@@ -26,6 +27,8 @@ const ICONS = {
   cloud: `${ASSETS_DIR}/cloud.svg`,
   kb: `${ASSETS_DIR}/book.svg`,
   glossary: `${ASSETS_DIR}/list-letters.svg`,
+  bookmarks: `${ASSETS_DIR}/bookmark.svg`,
+  bookmarkOff: `${ASSETS_DIR}/bookmark-off.svg`,
 } as const;
 const LIST_ICON_TINT = "#E5422C";
 const DOC_PRODUCTS = [
@@ -35,6 +38,7 @@ const DOC_PRODUCTS = [
   { title: "Cloud", value: "cloud", icon: ICONS.cloud },
   { title: "Knowledge Base", value: "knowledge-base", icon: ICONS.kb },
   { title: "Glossary", value: "glossary", icon: ICONS.glossary },
+  { title: "Bookmarks", value: "bookmarks", icon: ICONS.bookmarks },
 ] as const;
 type DocsProduct = (typeof DOC_PRODUCTS)[number]["value"];
 const cache = new Cache({ namespace: "craft-docs-search" });
@@ -56,27 +60,27 @@ export default function Command(props: Props) {
   const argumentTerm = props.arguments?.term?.trim();
   const deeplinkSlug = props.launchContext?.slug?.trim();
   const deeplinkProduct = props.launchContext?.product;
+  const forceAllDocsForArgument = Boolean(argumentTerm);
   const initialSearchText = argumentTerm || "";
   const initialSelectedProduct: DocsProduct =
-    deeplinkProduct && DOC_PRODUCTS.some((p) => p.value === deeplinkProduct) ? deeplinkProduct : DOC_PRODUCTS[0].value;
+    forceAllDocsForArgument
+      ? "all"
+      : deeplinkProduct && DOC_PRODUCTS.some((p) => p.value === deeplinkProduct)
+        ? deeplinkProduct
+        : DOC_PRODUCTS[0].value;
   const initialGlossaryItems =
     initialSelectedProduct === "glossary" && !initialSearchText
-      ? readCached(makeRequestCacheKey({ product: "glossary", query: "", version: undefined, scopes: [] })) ?? []
+      ? (readCached(makeRequestCacheKey({ product: "glossary", query: "", version: undefined, scopes: [] })) ?? [])
       : [];
   const initialShouldSearch = initialSearchText.trim().length > 0 || initialSelectedProduct === "glossary";
   const [searchText, setSearchText] = useState(initialSearchText);
   const [query, setQuery] = useState(initialSearchText);
-  const [selectedItemId, setSelectedItemId] = useState<string | undefined>(() => {
-    if (!deeplinkSlug || initialGlossaryItems.length === 0) return undefined;
-    const match =
-      initialGlossaryItems.find((item) => item.slug === deeplinkSlug) ||
-      initialGlossaryItems.find((item) => item.slug?.toLowerCase() === deeplinkSlug.toLowerCase());
-    return match?.id;
-  });
+  const [selectedItemId, setSelectedItemId] = useState<string | undefined>(undefined);
   const [selectedProduct, setSelectedProduct] = useCachedState<DocsProduct>(
     "craft-docs-selected-product",
     initialSelectedProduct,
   );
+  const [bookmarks, setBookmarks] = useCachedState<DocsSearchResult[]>("craft-docs-bookmarks", []);
   const [items, setItems] = useState<DocsSearchResult[]>(initialGlossaryItems);
   const [isLoading, setIsLoading] = useState(initialShouldSearch);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -104,13 +108,24 @@ export default function Command(props: Props) {
   const hasQuery = query.trim().length > 0;
   const isDebouncing = searchText.trim() !== query;
   const isGlossaryBrowse = selectedProduct === "glossary" && !hasQuery;
-  const shouldSearch = hasLiveQuery || selectedProduct === "glossary";
+  const isBookmarksMode = selectedProduct === "bookmarks";
+  const shouldSearch = hasLiveQuery || selectedProduct === "glossary" || isBookmarksMode;
+  const bookmarkedUrls = useMemo(() => new Set((bookmarks ?? []).map((item) => item.url)), [bookmarks]);
   const emptyViewContent = useMemo(
     () => buildEmptyViewContent(selectedProduct, preferences),
     [preferences, selectedProduct],
   );
 
   const visibleItems = useMemo(() => {
+    if (isBookmarksMode) {
+      const q = searchText.trim().toLowerCase();
+      if (!q) return bookmarks ?? [];
+      return (bookmarks ?? []).filter((item) => {
+        const haystack = `${item.title} ${item.slug ?? ""} ${item.summaryPlain ?? ""} ${item.url}`.toLowerCase();
+        return haystack.includes(q);
+      });
+    }
+
     return items.filter((item) => {
       const product = getProductType(item.url);
       if (selectedProduct === "all") {
@@ -128,25 +143,31 @@ export default function Command(props: Props) {
       if (isUnversionedProduct(selectedProduct)) return true;
       return matchesItemVersion(item, versionParam);
     });
-  }, [commerceVersion, cmsVersion, items, selectedProduct, versionParam]);
+  }, [bookmarks, commerceVersion, cmsVersion, isBookmarksMode, items, searchText, selectedProduct, versionParam]);
   const groupedGlossary = useMemo(
     () => (isGlossaryBrowse ? groupByLetter(visibleItems) : null),
     [isGlossaryBrowse, visibleItems],
   );
   const showPlaceholder =
-    !shouldSearch ||
+    (!shouldSearch && selectedProduct !== "bookmarks") ||
+    (selectedProduct === "bookmarks" && !errorMessage && visibleItems.length === 0) ||
     (shouldSearch &&
       !isGlossaryBrowse &&
+      !isBookmarksMode &&
       !errorMessage &&
       visibleItems.length === 0 &&
       (isLoading || isDebouncing));
   const showGlossaryLoadingRow = isGlossaryBrowse && !deeplinkSlug && !errorMessage && visibleItems.length === 0;
 
   useEffect(() => {
+    if (forceAllDocsForArgument) {
+      setSelectedProduct("all");
+      return;
+    }
     if (!deeplinkProduct) return;
     if (!DOC_PRODUCTS.some((p) => p.value === deeplinkProduct)) return;
     setSelectedProduct(deeplinkProduct);
-  }, [deeplinkProduct, setSelectedProduct]);
+  }, [deeplinkProduct, forceAllDocsForArgument, setSelectedProduct]);
 
   useEffect(() => {
     if (!deeplinkSlug) return;
@@ -172,12 +193,23 @@ export default function Command(props: Props) {
   }, [searchText, query, selectedProduct]);
 
   useEffect(() => {
+    if (selectedProduct === "bookmarks") {
+      setIsLoading(false);
+      return;
+    }
     if (query || selectedProduct === "glossary") {
       setIsLoading(true);
     }
   }, [selectedProduct, query]);
 
   useEffect(() => {
+    if (selectedProduct === "bookmarks") {
+      setErrorMessage(null);
+      setIsLoading(false);
+      abortRef.current?.abort();
+      return;
+    }
+
     if (!query && selectedProduct !== "glossary") {
       setItems([]);
       setErrorMessage(null);
@@ -257,6 +289,18 @@ export default function Command(props: Props) {
     return () => controller.abort();
   }, [query, apiVersionParam, requestCacheKey, scopes, selectedProduct]);
 
+  function addBookmark(item: DocsSearchResult) {
+    setBookmarks((current) => {
+      const existing = current ?? [];
+      if (existing.some((bookmark) => bookmark.url === item.url)) return existing;
+      return [item, ...existing];
+    });
+  }
+
+  function removeBookmark(item: DocsSearchResult) {
+    setBookmarks((current) => (current ?? []).filter((bookmark) => bookmark.url !== item.url));
+  }
+
   return (
     <List
       isLoading={isLoading}
@@ -282,7 +326,7 @@ export default function Command(props: Props) {
             <List.Dropdown.Item
               title={getDropdownTitle(DOC_PRODUCTS[0].value, preferences)}
               value={DOC_PRODUCTS[0].value}
-              icon={tintListIcon(DOC_PRODUCTS[0].icon)}
+              icon={tintSecondaryIcon(DOC_PRODUCTS[0].icon)}
             />
           </List.Dropdown.Section>
           <List.Dropdown.Section>
@@ -291,19 +335,26 @@ export default function Command(props: Props) {
                 key={product.value}
                 title={getDropdownTitle(product.value, preferences)}
                 value={product.value}
-                icon={tintListIcon(product.icon)}
+                icon={tintSecondaryIcon(product.icon)}
               />
             ))}
           </List.Dropdown.Section>
           <List.Dropdown.Section>
-            {DOC_PRODUCTS.slice(4).map((product) => (
+            {DOC_PRODUCTS.slice(4, 6).map((product) => (
               <List.Dropdown.Item
                 key={product.value}
                 title={getDropdownTitle(product.value, preferences)}
                 value={product.value}
-                icon={tintListIcon(product.icon)}
+                icon={tintSecondaryIcon(product.icon)}
               />
             ))}
+          </List.Dropdown.Section>
+          <List.Dropdown.Section>
+            <List.Dropdown.Item
+              title={getDropdownTitle(DOC_PRODUCTS[6].value, preferences)}
+              value={DOC_PRODUCTS[6].value}
+              icon={tintSecondaryIcon(DOC_PRODUCTS[6].icon)}
+            />
           </List.Dropdown.Section>
         </List.Dropdown>
       }
@@ -329,22 +380,35 @@ export default function Command(props: Props) {
 
       {shouldSearch &&
         !errorMessage &&
-        (isGlossaryBrowse
-          ? groupedGlossary?.keys.map((letter) => (
-              <List.Section key={letter} title={letter}>
-                {(groupedGlossary.map.get(letter) ?? []).map((item) => (
-                  <ResultRow
-                    key={item.id}
-                    item={item}
-                    selectedProduct={selectedProduct}
-                    isCompactMode={isCompactMode}
-                  />
-                ))}
-              </List.Section>
-            ))
-          : visibleItems.map((item) => (
-              <ResultRow key={item.id} item={item} selectedProduct={selectedProduct} isCompactMode={isCompactMode} />
-            )))}
+        (isGlossaryBrowse ? (
+          groupedGlossary?.keys.map((letter) => (
+            <List.Section key={letter} title={letter}>
+              {(groupedGlossary.map.get(letter) ?? []).map((item) => (
+                <ResultRow
+                  key={item.id}
+                  item={item}
+                  selectedProduct={selectedProduct}
+                  isCompactMode={isCompactMode}
+                  isBookmarked={bookmarkedUrls.has(item.url)}
+                  onAddBookmark={addBookmark}
+                  onRemoveBookmark={removeBookmark}
+                />
+              ))}
+            </List.Section>
+          ))
+        ) : (
+          visibleItems.map((item) => (
+            <ResultRow
+              key={item.id}
+              item={item}
+              selectedProduct={selectedProduct}
+              isCompactMode={isCompactMode}
+              isBookmarked={bookmarkedUrls.has(item.url)}
+              onAddBookmark={addBookmark}
+              onRemoveBookmark={removeBookmark}
+            />
+          ))
+        ))}
     </List>
   );
 }
@@ -353,16 +417,23 @@ function ResultRow({
   item,
   selectedProduct,
   isCompactMode,
+  isBookmarked,
+  onAddBookmark,
+  onRemoveBookmark,
 }: {
   item: DocsSearchResult;
   selectedProduct: DocsProduct;
   isCompactMode: boolean;
+  isBookmarked: boolean;
+  onAddBookmark: (item: DocsSearchResult) => void;
+  onRemoveBookmark: (item: DocsSearchResult) => void;
 }) {
   return (
     <List.Item
       id={item.id}
       title={item.title}
       subtitle={isCompactMode ? buildSubtitle(item) : undefined}
+      accessories={buildBookmarkAccessory(isBookmarked, selectedProduct)}
       icon={buildListIcon(item, selectedProduct, isCompactMode)}
       detail={isCompactMode ? undefined : <DocsItemDetail item={item} />}
       actions={
@@ -387,6 +458,21 @@ function ResultRow({
               ))}
             </ActionPanel.Submenu>
           )}
+          {isBookmarked ? (
+            <Action
+              title="Remove Bookmark"
+              icon={ACTION_ICONS.removeBookmark}
+              onAction={() => onRemoveBookmark(item)}
+              shortcut={{ modifiers: ["cmd"], key: "b" }}
+            />
+          ) : (
+            <Action
+              title="Bookmark"
+              icon={ACTION_ICONS.bookmark}
+              onAction={() => onAddBookmark(item)}
+              shortcut={{ modifiers: ["cmd"], key: "b" }}
+            />
+          )}
           <Action.CopyToClipboard title="Copy URL" content={item.url} icon={ACTION_ICONS.clipboard} />
         </ActionPanel>
       }
@@ -395,6 +481,24 @@ function ResultRow({
 }
 
 function DocsDetailView({ item }: { item: DocsSearchResult }) {
+  const [bookmarks, setBookmarks] = useCachedState<DocsSearchResult[]>("craft-docs-bookmarks", []);
+  const isBookmarked = useMemo(
+    () => (bookmarks ?? []).some((bookmark) => bookmark.url === item.url),
+    [bookmarks, item.url],
+  );
+
+  function addBookmark(detailItem: DocsSearchResult) {
+    setBookmarks((current) => {
+      const existing = current ?? [];
+      if (existing.some((bookmark) => bookmark.url === detailItem.url)) return existing;
+      return [detailItem, ...existing];
+    });
+  }
+
+  function removeBookmark(detailItem: DocsSearchResult) {
+    setBookmarks((current) => (current ?? []).filter((bookmark) => bookmark.url !== detailItem.url));
+  }
+
   return (
     <Detail
       markdown={buildDetailMarkdown(item)}
@@ -417,6 +521,21 @@ function DocsDetailView({ item }: { item: DocsSearchResult }) {
                 />
               ))}
             </ActionPanel.Submenu>
+          )}
+          {isBookmarked ? (
+            <Action
+              title="Remove Bookmark"
+              icon={ACTION_ICONS.removeBookmark}
+              onAction={() => removeBookmark(item)}
+              shortcut={{ modifiers: ["cmd"], key: "b" }}
+            />
+          ) : (
+            <Action
+              title="Bookmark"
+              icon={ACTION_ICONS.bookmark}
+              onAction={() => addBookmark(item)}
+              shortcut={{ modifiers: ["cmd"], key: "b" }}
+            />
           )}
           <Action.CopyToClipboard title="Copy URL" content={item.url} icon={ACTION_ICONS.clipboard} />
         </ActionPanel>
@@ -565,7 +684,7 @@ function isVersionExemptType(type?: string): boolean {
 }
 
 function isUnversionedProduct(product: DocsProduct): boolean {
-  return product === "cloud" || product === "knowledge-base" || product === "glossary";
+  return product === "cloud" || product === "knowledge-base" || product === "glossary" || product === "bookmarks";
 }
 
 function getAllDocsSourceLabel(item: DocsSearchResult): "CMS" | "Commerce" | "Cloud" | "KB" | "Term" {
@@ -606,10 +725,7 @@ function buildEmptyViewIcon(selectedProduct: DocsProduct): { source: string; tin
   return tintListIcon(product.icon);
 }
 
-function buildEmptyViewContent(
-  product: DocsProduct,
-  preferences: Preferences,
-): { title: string; description: string } {
+function buildEmptyViewContent(product: DocsProduct, preferences: Preferences): { title: string; description: string } {
   if (product === "cms") {
     return {
       title: "Craft CMS Docs",
@@ -638,6 +754,12 @@ function buildEmptyViewContent(
     return {
       title: "Craft Glossary",
       description: "Search or browse Craft CMS glossary terms.",
+    };
+  }
+  if (product === "bookmarks") {
+    return {
+      title: "Bookmarks",
+      description: "Your saved documentation entries.",
     };
   }
   return {
@@ -701,6 +823,7 @@ function buildScopes({
   cmsVersion: DocsSearchResult["craftVersion"] | undefined;
   versionParam: DocsSearchResult["craftVersion"] | undefined;
 }): string[] {
+  if (selectedProduct === "bookmarks") return [];
   if (selectedProduct === "cms") {
     return [versionParam ? `docs/${versionParam}` : `docs/${cmsVersion ?? "5.x"}`];
   }
@@ -717,6 +840,7 @@ function getDropdownTitle(product: DocsProduct, preferences: Preferences): strin
 }
 
 function buildSearchPlaceholder(product: DocsProduct, preferences: Preferences): string {
+  if (product === "bookmarks") return "Search Bookmarks...";
   if (product === "cms") return `Search Craft CMS ${preferences.cmsVersion} Docs...`;
   if (product === "commerce") return `Search Craft Commerce ${preferences.commerceVersion} Docs...`;
   if (product === "cloud") return "Search Craft Cloud Docs...";
@@ -757,8 +881,22 @@ function groupByLetter(items: DocsSearchResult[]) {
   return { keys, map };
 }
 const ACTION_ICONS = {
-  globe: { source: Icon.Globe, tintColor: LIST_ICON_TINT },
-  book: { source: Icon.Book, tintColor: LIST_ICON_TINT },
-  clipboard: { source: Icon.Clipboard, tintColor: LIST_ICON_TINT },
-  sidebar: { source: Icon.Sidebar, tintColor: LIST_ICON_TINT },
+  globe: { source: `${ASSETS_DIR}/world.svg`, tintColor: Color.SecondaryText },
+  book: { source: `${ASSETS_DIR}/book.svg`, tintColor: Color.SecondaryText },
+  clipboard: { source: `${ASSETS_DIR}/clipboard.svg`, tintColor: Color.SecondaryText },
+  sidebar: { source: Icon.Sidebar, tintColor: Color.SecondaryText },
+  bookmark: { source: ICONS.bookmarks, tintColor: Color.SecondaryText },
+  removeBookmark: { source: ICONS.bookmarkOff, tintColor: Color.SecondaryText },
 } as const;
+
+function buildBookmarkAccessory(
+  isBookmarked: boolean,
+  selectedProduct: DocsProduct,
+): List.Item.Accessory[] | undefined {
+  if (!isBookmarked || selectedProduct === "bookmarks") return undefined;
+  return [{ icon: { source: ICONS.bookmarks, tintColor: Color.SecondaryText }, tooltip: "Bookmarked" }];
+}
+
+function tintSecondaryIcon(source: string | Icon): { source: string | Icon; tintColor: Color } {
+  return { source, tintColor: Color.SecondaryText };
+}
