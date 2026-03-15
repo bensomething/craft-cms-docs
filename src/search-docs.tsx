@@ -17,7 +17,6 @@ import { useCachedState } from "@raycast/utils";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { extractRelatedTermsFromHtml, searchDocs, searchGlossary, splitAssociatedLinks } from "./api";
 import { usePersistentBookmarks } from "./bookmarks-storage";
-import { raycastLinkForSlug } from "./config";
 import { summaryHtmlToMarkdown } from "./summary-to-markdown";
 import type { DocsSearchResult, GlossaryTerm } from "./types";
 
