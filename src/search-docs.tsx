@@ -438,7 +438,6 @@ export default function Command(props: Props) {
           </List.Dropdown.Section>
         </List.Dropdown>
       }
-      throttle
     >
       {showPlaceholder && (
         <List.EmptyView
